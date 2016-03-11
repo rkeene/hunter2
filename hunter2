@@ -251,6 +251,11 @@ proc _prompt {prompt} {
 }
 
 proc _getPassword {name} {
+	set exists [db eval {SELECT 1 FROM passwords WHERE name = $name LIMIT 1;}]
+	if {$exists != "1"} {
+		return -code error "Password \"$name\" does not exists."
+	}
+
 	foreach slotInfoDict [_listCertificates] {
 		unset -nocomplain slotInfo
 		array set slotInfo $slotInfoDict
@@ -284,6 +289,11 @@ proc _getPassword {name} {
 }
 
 proc _modifyPublicKeys {passwordName userNames sql} {
+	set exists [db eval {SELECT 1 FROM passwords WHERE name = $passwordName LIMIT 1;}]
+	if {$exists != "1"} {
+		return -code error "Password \"$passwordName\" does not exists."
+	}
+
 	set publicKeys [list]
 
 	db eval {SELECT publicKey FROM passwords WHERE name = $passwordName;} row {
