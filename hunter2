@@ -519,7 +519,13 @@ db eval {
 }
 
 if {$action in $validCommands} {
-	$action {*}$argv
+	if {[catch {
+		$action {*}$argv
+	} error]} {
+		puts stderr "Error: $error"
+
+		exit 1
+	}
 } else {
 	puts stderr "Invalid action"
 
