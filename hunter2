@@ -442,6 +442,10 @@ proc getPassword {passwordName} {
 }
 
 proc updatePassword {passwordName password} {
+	if {$password eq ""} {
+		set password [_prompt "Please enter the new password: "]
+	}
+
 	db eval {SELECT publicKey FROM passwords WHERE name = $passwordName;} row {
 		lappend publicKeys $row(publicKey)
 	}
