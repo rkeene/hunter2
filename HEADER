@@ -1,0 +1,8 @@
+                                @@UTIL@@ @@VERS@@
+
+Release information:
+  pkg:  @@UTIL@@ version @@VERS@@
+  url:  http://www.rkeene.org/devel/@@UTIL@@-@@VERS@@.tar.gz
+  date: @@DATE@@
+--------------------------------------------------------------------------
+
