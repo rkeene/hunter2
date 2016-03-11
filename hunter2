@@ -1,0 +1,490 @@
+#! /usr/bin/env tclsh
+
+set passwordFile [lindex $argv 0]
+set action [lindex $argv 1]
+
+set validCommands [list "listLocalKeys" "listPasswords" "listAvailablePasswords" "listUsers" "addUser" "addPassword" "authorizeUser" "authorizeUsers" "deauthorizeUser" "deauthorizeUsers" "getPassword" "updatePassword" "deletePassword" "help"]
+
+proc _argDescription {command argName} {
+	switch -- $argName {
+		"passwordName" {
+			return "$argName - Name of the password entry"
+		}
+		"key" {
+			return "$argName - Public key of the user"
+		}
+		"password" {
+			return "$argName - A plain-text password"
+		}
+		"userName" {
+			return "$argName - A user name"
+		}
+		"action" {
+			return "$argName - An action name for help with"
+		}
+		"args" {
+			return "userList - A list of usernames"
+		}
+	}
+
+	return "<UNKNOWN>"
+}
+
+proc _printHelp {channel command} {
+	if {$command == ""} {
+		puts $channel "Usage: hunter2 <passwordFile> <action> \[<actionArgs...>\]"
+		puts $channel ""
+		puts $channel "Actions:"
+		puts $channel "    [join $::validCommands {, }]"
+		puts $channel ""
+		puts $channel "    hunter2 <file> help <action>    for help with an action"
+	} else {
+		set args [info args $command]
+		set printArgs [list]
+		foreach arg $args {
+			if {$arg == "args"} {
+				set arg "userList"
+			}
+			lappend printArgs "<$arg>"
+		}
+
+		puts $channel "Usage: hunter2 <passwordFile> $command [join $printArgs]"
+
+		if {[llength $args] > 0} {
+			puts $channel ""
+			puts $channel "Arguments:"
+			foreach arg $args {
+				puts $channel "    [_argDescription $command $arg]"
+			}
+		}
+	}
+}
+
+if {[llength $argv] < 2} {
+	_printHelp stderr ""
+
+	exit 1
+}
+
+set argv [lrange $argv 2 end]
+
+package require sqlite3
+package require platform
+
+lappend ::auto_path [file join [file dirname [info script]] lib [platform::identify]]
+lappend ::auto_path [file join [file dirname [info script]] lib [platform::generic]]
+lappend ::auto_path [file join [file dirname [info script]] lib]
+
+package require pki
+package require pki::pkcs11
+package require aes
+
+# Backports for older versions of "pki"
+proc ::pki::pkcs::parse_public_key {key {password ""}} {
+        array set parsed_key [::pki::_parse_pem $key "-----BEGIN PUBLIC KEY-----" "-----END PUBLIC KEY-----" $password]
+
+        set key_seq $parsed_key(data)
+
+        ::asn::asnGetSequence key_seq pubkeyinfo
+                ::asn::asnGetSequence pubkeyinfo pubkey_algoid
+                        ::asn::asnGetObjectIdentifier pubkey_algoid oid
+                ::asn::asnGetBitString pubkeyinfo pubkey
+        set ret(pubkey_algo) [::pki::_oid_number_to_name $oid]
+
+        switch -- $ret(pubkey_algo) {
+                "rsaEncryption" {
+                        set pubkey [binary format B* $pubkey]
+
+                        ::asn::asnGetSequence pubkey pubkey_parts
+                                ::asn::asnGetBigInteger pubkey_parts ret(n)
+                                ::asn::asnGetBigInteger pubkey_parts ret(e)
+
+                        set ret(n) [::math::bignum::tostr $ret(n)]
+                        set ret(e) [::math::bignum::tostr $ret(e)]
+                        set ret(l) [expr {int([::pki::_bits $ret(n)] / 8.0000 + 0.5) * 8}]
+                        set ret(type) rsa
+                }
+                default {
+                        error "Unknown algorithm"
+                }
+        }
+
+        return [array get ret]
+}
+
+proc ::pki::rsa::serialize_public_key {keylist} {
+        array set key $keylist
+
+        foreach entry [list n e] {
+                if {![info exists key($entry)]} {
+                        return -code error "Key does not contain an element $entry"
+                }
+        }
+
+        set pubkey [::asn::asnSequence \
+                [::asn::asnBigInteger [::math::bignum::fromstr $key(n)]] \
+                [::asn::asnBigInteger [::math::bignum::fromstr $key(e)]] \
+                ]  
+        set pubkey_algo_params [::asn::asnNull]
+
+        binary scan $pubkey B* pubkey_bitstring
+
+        set ret [::asn::asnSequence \
+                [::asn::asnSequence \
+                                [::asn::asnObjectIdentifier [::pki::_oid_name_to_number rsaEncryption]] \
+                                $pubkey_algo_params \
+                        ] \
+                        [::asn::asnBitString $pubkey_bitstring] \
+                        ]
+
+        return [list data $ret begin "-----BEGIN PUBLIC KEY-----" end "-----END PUBLIC KEY-----"]
+}
+# End backports
+
+# Start internal functions
+proc _listCertificates {} {
+	if {![info exists ::env(PKCS11MODULE)]} {
+		return [list]
+	}
+
+	set ::env(CACKEY_NO_EXTRA_CERTS) 1
+
+	set handle [::pki::pkcs11::loadmodule $::env(PKCS11MODULE)]
+
+	set slotInfo [list]
+	foreach slot [::pki::pkcs11::listslots $handle] {
+		set slotID [lindex $slot 0]
+		set slotLabel [lindex $slot 1]
+		set slotFlags [lindex $slot 2]
+
+		if {"TOKEN_PRESENT" ni $slotFlags} {
+			continue
+		}
+
+		if {"TOKEN_INITIALIZED" ni $slotFlags} {
+			continue
+		}
+
+		set slotPromptForPIN false
+		if {"PROTECTED_AUTHENTICATION_PATH" ni $slotFlags} {
+			if {"LOGIN_REQUIRED" in $slotFlags} {
+				set slotPromptForPIN true
+			}
+		}
+
+		foreach cert [::pki::pkcs11::listcerts $handle $slotID] {
+			set pubkey [binary encode base64 [dict get [::pki::rsa::serialize_public_key $cert] data]]
+
+			lappend slotInfo [list handle $handle id $slotID prompt $slotPromptForPIN cert $cert pubkey $pubkey]
+		}
+	}
+
+	return $slotInfo
+}
+
+proc _addPassword {name password publicKeys} {
+	set fd [open "/dev/urandom" r]
+	fconfigure $fd -translation binary
+
+	db eval {DELETE FROM passwords WHERE name = $name;}
+
+	foreach publicKey $publicKeys {
+		set key [read $fd 16]
+		if {[string length $key] != 16} {
+			close $fd
+
+			return -code error "ERROR: Short read from random device"
+		}
+
+		set publicKeyItem [::pki::pkcs::parse_public_key [binary decode base64 $publicKey]]
+
+		set encryptedKey [binary encode base64 [::pki::encrypt -pub -binary -- $key $publicKeyItem]]
+
+		set encryptedPass [binary encode base64 [::aes::aes -dir encrypt -key $key -- $password]]
+
+		db eval {INSERT INTO passwords (name, encryptedPass, encryptedKey, publicKey) VALUES ($name, @encryptedPass, @encryptedKey, @publicKey);}
+	}
+
+	close $fd
+}
+
+proc _prompt {prompt} {
+	puts -nonewline $prompt
+	flush stdout
+
+	puts -nonewline [exec stty -echo]
+	flush stdout
+
+	set password [gets stdin]
+
+	puts -nonewline [exec stty echo]
+	puts ""
+	flush stdout
+
+	return $password
+}
+
+proc _getPassword {name} {
+	foreach slotInfoDict [_listCertificates] {
+		unset -nocomplain slotInfo
+		array set slotInfo $slotInfoDict
+
+		set pubkey $slotInfo(pubkey)
+		set prompt $slotInfo(prompt)
+
+		if {[info exists prompted($slotInfo(id))]} {
+			set prompt false
+		}
+
+		if {$prompt} {
+			set PIN [_prompt "Please enter the PIN for [dict get $slotInfo(cert) subject]: "]
+
+			if {![::pki::pkcs11::login $slotInfo(handle) $slotInfo(id) $PIN]} {
+				return -code error "Unable to authenticate"
+			}
+
+			set prompted($slotInfo(id)) 1
+		}
+
+		db eval {SELECT encryptedPass, encryptedKey FROM passwords WHERE name = $name AND publicKey = $pubkey;} row {
+			set key [::pki::decrypt -binary -priv -- [binary decode base64 $row(encryptedKey)] $slotInfo(cert)]
+			set password [::aes::aes -dir decrypt -key $key -- [binary decode base64 $row(encryptedPass)]]
+
+			return $password
+		}
+	}
+
+	return -code error "No valid keys"
+}
+
+proc _modifyPublicKeys {passwordName userNames sql} {
+	set publicKeys [list]
+
+	db eval {SELECT publicKey FROM passwords WHERE name = $passwordName;} row {
+		lappend publicKeys $row(publicKey)
+	}
+
+	set changeRequired 0
+	foreach user $userNames {
+		unset -nocomplain row
+		db eval {SELECT publicKey FROM users WHERE name = $user;} row $sql
+	}
+
+	if {!$changeRequired} {
+		return
+	}
+
+	set password [_getPassword $passwordName]
+
+	_addPassword $passwordName $password $publicKeys
+}
+
+proc _getUsersForPassword {passwordNames} {
+	set userNames [list]
+
+	foreach passwordName $passwordNames {
+		db eval {SELECT publicKey FROM passwords WHERE name = $passwordName;} passwordRow {
+			db eval {SELECT name FROM users WHERE publicKey = $passwordRow(publicKey)} userRow {
+				if {$userRow(name) in $userNames} {
+					continue
+				}
+
+				lappend userNames $userRow(name)
+			}
+		}
+	}
+
+	return $userNames
+}
+
+proc _getPasswordsForUser {userNames} {
+	set passwordNames [list]
+
+	foreach userName $userNames {
+		db eval {SELECT publicKey FROM users WHERE name = $userName;} userRow {
+			db eval {SELECT name FROM passwords WHERE publicKey = $userRow(publicKey)} passwordRow {
+				if {$passwordRow(name) in $passwordNames} {
+					continue
+				}
+
+				lappend passwordNames $passwordRow(name)
+			}
+		}
+	}
+
+	return $passwordNames
+}
+# End internal functions
+
+# Start user CLI functions
+proc listLocalKeys {} {
+	foreach slotInfoDict [_listCertificates] {
+		unset -nocomplain slotInfo
+		array set slotInfo $slotInfoDict
+
+		set subject [dict get $slotInfo(cert) subject]
+		set pubkey  $slotInfo(pubkey)
+
+		lappend publicKeys($subject) $pubkey
+	}
+
+	foreach {subject pubkeys} [array get publicKeys] {
+		puts "$subject"
+
+		foreach pubkey $pubkeys {
+			puts "  |-> $pubkey"
+		}
+	}
+}
+
+proc listAvailablePasswords {} {
+	set passwordNames [list]
+	foreach slotInfoDict [_listCertificates] {
+		unset -nocomplain slotInfo
+		array set slotInfo $slotInfoDict
+
+		set pubkey $slotInfo(pubkey)
+
+		unset -nocomplain row
+		db eval {SELECT name FROM passwords WHERE publicKey = $pubkey;} row {
+			if {$row(name) in $passwordNames} {
+				continue
+			}
+
+			lappend passwordNames $row(name)
+		}
+	}
+
+
+	foreach passwordName $passwordNames {
+		puts "$passwordName - [join [_getUsersForPassword [list $passwordName]] {, }]"
+	}
+}
+
+proc listPasswords {} {
+	db eval {SELECT DISTINCT name FROM passwords;} row {
+		puts "$row(name) - [join [_getUsersForPassword [list $row(name)]] {, }]"
+	}
+}
+
+proc listUsers {} {
+	db eval {SELECT DISTINCT name FROM users;} row {
+		puts "$row(name) - [join [_getPasswordsForUser [list $row(name)]] {, }]"
+	}
+}
+
+proc addUser {userName key} {
+	set keyRaw [binary decode base64 $key]
+	set keyVerify [::pki::pkcs::parse_public_key $keyRaw]
+
+	db eval {INSERT INTO users (name, publicKey) VALUES ($userName, @key);}
+
+	# XXX:TODO:Go through and re-authorize if possible
+}
+
+proc deleteUser {userName} {
+	# XXX:TODO: Go through and de-authorize
+}
+
+proc addPassword {passwordName password args} {
+	set initialUsers $args
+
+	if {$password eq ""} {
+		set password [_prompt "Please enter the new password: "]
+	}
+
+	# Verify that this password does not already exist
+	set exists [db eval {SELECT 1 FROM passwords WHERE name = $passwordName LIMIT 1;}]
+	if {$exists == "1"} {
+		return -code error "Password \"$passwordName\" already exists, cannot add."
+	}
+
+	# Get keys for initial users
+	set publicKeys [list]
+	foreach user $initialUsers {
+		unset -nocomplain row
+		db eval {SELECT publicKey FROM users WHERE name = $user;} row {
+			lappend publicKeys $row(publicKey)
+		}
+	}
+
+	_addPassword $passwordName $password $publicKeys
+}
+
+proc getPassword {passwordName} {
+	puts [_getPassword $passwordName]
+}
+
+proc updatePassword {passwordName password} {
+	db eval {SELECT publicKey FROM passwords WHERE name = $passwordName;} row {
+		lappend publicKeys $row(publicKey)
+	}
+
+	_addPassword $passwordName $password $publicKeys
+}
+
+proc deletePassword {passwordName} {
+	db eval {DELETE FROM passwords WHERE name = $passwordName;}
+}
+
+proc authorizeUsers {passwordName args} {
+	set users $args
+
+	_modifyPublicKeys $passwordName $users {
+		if {$row(publicKey) in $publicKeys} {
+			continue
+		}
+
+		lappend publicKeys $row(publicKey)
+
+		set changeRequired 1
+	}
+}
+
+proc authorizeUser {passwordName userName} {
+	return [authorizeUsers $passwordName $userName]
+}
+
+proc deauthorizeUsers {passwordName args} {
+	set users $args
+
+	_modifyPublicKeys $passwordName $users {
+		set idx [lsearch -exact $publicKeys $row(publicKey)]
+		if {$idx == -1} {
+			continue
+		}
+
+		set publicKeys [lreplace $publicKeys $idx $idx]
+
+		set changeRequired 1
+	}
+}
+
+proc deauthorizeUser {passwordName userName} {
+	return [deauthorizeUsers $passwordName $userName]
+}
+
+proc help {{action ""}} {
+	_printHelp stdout $action
+}
+# End user CLI functions
+
+### MAIN
+
+sqlite3 db $passwordFile
+
+db eval {
+	CREATE TABLE IF NOT EXISTS users(name, publicKey BLOB);
+	CREATE TABLE IF NOT EXISTS passwords(name, encryptedPass BLOB, encryptedKey BLOB, publicKey BLOB);
+}
+
+if {$action in $validCommands} {
+	$action {*}$argv
+} else {
+	puts stderr "Invalid action"
+
+	exit 1
+}
+
+exit 0
+
