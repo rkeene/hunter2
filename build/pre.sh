@@ -15,6 +15,11 @@ set -e
 cd "${ourdir}/.."
 
 rm -rf lib
+
+if [ "$1" = 'clean' -o "$1" = 'distclean' ]; then
+	exit 0
+fi
+
 "${TCLKIT:-tclkit}" "${ourdir}/teapot-client.kit" get . tcl tcl pki aes
 
 for platform in linux-ix86 linux-x86_64 macosx-ix86 macosx-x86_64 win32-ix86 win32-x86_64; do
